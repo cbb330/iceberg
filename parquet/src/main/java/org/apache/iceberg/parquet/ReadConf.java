@@ -91,20 +91,28 @@ class ReadConf<T> {
     this.rowGroups = reader.getRowGroups();
     this.shouldSkip = new boolean[rowGroups.size()];
 
+    // Fold predicates on initial-default columns that are absent from this file against the column
+    // default. Otherwise the row-group filters treat the missing column as all-null and skip the
+    // row group, silently dropping the rows the default backfills (incl. via inferred IsNotNull).
+    // See #16690.
+    Expression fileFilter =
+        ParquetFilters.replaceMissingColumnDefaults(
+            filter, expectedSchema, ParquetSchemaUtil.convert(typeWithIds), caseSensitive);
+
     ParquetMetricsRowGroupFilter statsFilter = null;
     ParquetDictionaryRowGroupFilter dictFilter = null;
     ParquetBloomRowGroupFilter bloomFilter = null;
-    if (filter != null) {
-      statsFilter = new ParquetMetricsRowGroupFilter(expectedSchema, filter, caseSensitive);
-      dictFilter = new ParquetDictionaryRowGroupFilter(expectedSchema, filter, caseSensitive);
-      bloomFilter = new ParquetBloomRowGroupFilter(expectedSchema, filter, caseSensitive);
+    if (fileFilter != null) {
+      statsFilter = new ParquetMetricsRowGroupFilter(expectedSchema, fileFilter, caseSensitive);
+      dictFilter = new ParquetDictionaryRowGroupFilter(expectedSchema, fileFilter, caseSensitive);
+      bloomFilter = new ParquetBloomRowGroupFilter(expectedSchema, fileFilter, caseSensitive);
     }
 
     long computedTotalValues = 0L;
     for (int i = 0; i < shouldSkip.length; i += 1) {
       BlockMetaData rowGroup = rowGroups.get(i);
       boolean shouldRead =
-          filter == null
+          fileFilter == null
               || (statsFilter.shouldRead(typeWithIds, rowGroup)
                   && dictFilter.shouldRead(
                       typeWithIds, rowGroup, reader.getDictionaryReader(rowGroup))

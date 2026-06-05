@@ -19,7 +19,9 @@
 package org.apache.iceberg.parquet;
 
 import java.nio.ByteBuffer;
+import java.util.Map;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.BoundPredicate;
 import org.apache.iceberg.expressions.BoundReference;
 import org.apache.iceberg.expressions.Expression;
@@ -29,6 +31,8 @@ import org.apache.iceberg.expressions.ExpressionVisitors.ExpressionVisitor;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.expressions.Literal;
 import org.apache.iceberg.expressions.UnboundPredicate;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.types.Types;
 import org.apache.parquet.filter2.compat.FilterCompat;
 import org.apache.parquet.filter2.predicate.FilterApi;
 import org.apache.parquet.filter2.predicate.FilterPredicate;
@@ -48,6 +52,137 @@ class ParquetFilters {
       return FilterCompat.get(pred);
     } else {
       return FilterCompat.NOOP;
+    }
+  }
+
+  /**
+   * Folds predicates on initial-default columns that are absent from a data file against the column
+   * default, instead of letting them be applied to the (physically missing, hence null) column.
+   *
+   * <p>A column added by schema evolution with an {@code initial-default} is backfilled with the
+   * default at read time, but record-level filtering runs <em>before</em> that injection. For a
+   * file written before the column existed the record filter would see the column as null and drop
+   * every row — silently removing exactly the rows the default backfills (including via the {@code
+   * IsNotNull} that engines infer for null-intolerant predicates). This evaluates such predicates
+   * against the default value and folds them to {@code alwaysTrue}/{@code alwaysFalse}, the same
+   * way partition predicates are folded out of the residual. Predicates on columns the file
+   * actually contains are returned unchanged so that normal record, stats, dictionary, and bloom
+   * filtering still applies (and still prunes those files on the column's real values).
+   *
+   * @param expr a residual filter expression
+   * @param expectedSchema the table read schema, whose fields carry initial-default values
+   * @param fileSchema the physical schema of the data file being read
+   * @param caseSensitive whether column resolution is case sensitive
+   * @return the filter with absent initial-default columns folded to their default value
+   */
+  static Expression replaceMissingColumnDefaults(
+      Expression expr, Schema expectedSchema, Schema fileSchema, boolean caseSensitive) {
+    if (expr == null || expectedSchema == null) {
+      return expr;
+    }
+
+    Map<Integer, Object> missingDefaults = Maps.newHashMap();
+    for (Types.NestedField field : expectedSchema.columns()) {
+      if (field.initialDefault() != null && fileSchema.findField(field.fieldId()) == null) {
+        missingDefaults.put(field.fieldId(), field.initialDefault());
+      }
+    }
+
+    if (missingDefaults.isEmpty()) {
+      return expr;
+    }
+
+    return ExpressionVisitors.visit(
+        expr, new ReplaceMissingColumnDefaults(expectedSchema, missingDefaults, caseSensitive));
+  }
+
+  private static class ReplaceMissingColumnDefaults extends ExpressionVisitor<Expression> {
+    private final Schema schema;
+    private final Map<Integer, Object> missingDefaults;
+    private final boolean caseSensitive;
+
+    private ReplaceMissingColumnDefaults(
+        Schema schema, Map<Integer, Object> missingDefaults, boolean caseSensitive) {
+      this.schema = schema;
+      this.missingDefaults = missingDefaults;
+      this.caseSensitive = caseSensitive;
+    }
+
+    @Override
+    public Expression alwaysTrue() {
+      return Expressions.alwaysTrue();
+    }
+
+    @Override
+    public Expression alwaysFalse() {
+      return Expressions.alwaysFalse();
+    }
+
+    @Override
+    public Expression not(Expression result) {
+      return Expressions.not(result);
+    }
+
+    @Override
+    public Expression and(Expression leftResult, Expression rightResult) {
+      return Expressions.and(leftResult, rightResult);
+    }
+
+    @Override
+    public Expression or(Expression leftResult, Expression rightResult) {
+      return Expressions.or(leftResult, rightResult);
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> Expression predicate(BoundPredicate<T> pred) {
+      if (!(pred.term() instanceof BoundReference)) {
+        // transform term (e.g. truncate(col)); not folded, normal handling applies
+        return pred;
+      }
+
+      int fieldId = pred.ref().fieldId();
+      if (!missingDefaults.containsKey(fieldId)) {
+        // the column is present in the file (or has no default): keep the predicate so the file is
+        // still filtered/pruned on the column's real values
+        return pred;
+      }
+
+      T defaultValue = (T) missingDefaults.get(fieldId);
+      return pred.test(defaultValue) ? Expressions.alwaysTrue() : Expressions.alwaysFalse();
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> Expression predicate(UnboundPredicate<T> pred) {
+      Expression bound;
+      try {
+        bound = pred.bind(schema.asStruct(), caseSensitive);
+      } catch (ValidationException e) {
+        // the predicate does not resolve against the read schema; leave it untouched
+        return pred;
+      }
+
+      if (!(bound instanceof BoundPredicate)) {
+        // binding already reduced this to alwaysTrue/alwaysFalse
+        return bound;
+      }
+
+      BoundPredicate<T> boundPred = (BoundPredicate<T>) bound;
+      if (!(boundPred.term() instanceof BoundReference)) {
+        // transform term (e.g. truncate(col)); not folded, normal handling applies
+        return pred;
+      }
+
+      int fieldId = boundPred.ref().fieldId();
+      if (!missingDefaults.containsKey(fieldId)) {
+        // the column is present in the file (or has no default): keep the predicate so the file is
+        // still filtered/pruned on the column's real values
+        return pred;
+      }
+
+      T defaultValue = (T) missingDefaults.get(fieldId);
+      return boundPred.test(defaultValue) ? Expressions.alwaysTrue() : Expressions.alwaysFalse();
     }
   }
 
